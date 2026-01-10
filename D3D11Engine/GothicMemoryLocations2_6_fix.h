@@ -326,8 +326,9 @@ struct GothicMemoryLocations {
 
     struct zCParser {
         static const unsigned int CallFunc = 0x7929F0;
+        static const unsigned int GetIndex = 0x00793470;
     };
-
+    
     struct zCMorphMesh {
         static const unsigned int Offset_MorphMesh = 0x38;
         static const unsigned int Offset_TexAniState = 0x40;

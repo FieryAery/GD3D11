@@ -16,6 +16,9 @@
 
 // TODO: Remove this!
 #include "D3D11GraphicsEngine.h"
+#include "oCGame.h"
+
+constexpr float snowSpeedFactor = 0.25f;
 
 D3D11Effect::D3D11Effect() {
     RainBufferDrawFrom = nullptr;
@@ -96,19 +99,25 @@ XRESULT D3D11Effect::DrawRain() {
     auto streamOutGS = e->GetShaderManager().GetGShader( "GS_ParticleStreamOut" );
     auto particleAdvanceVS = e->GetShaderManager().GetVShader( "VS_AdvanceRain" );
     auto particleVS = e->GetShaderManager().GetVShader( "VS_ParticlePointShaded" );
-    auto rainPS = e->GetShaderManager().GetPShader( "PS_Rain" );
+    
+    bool isSnow = oCGame::GetGame()
+        && oCGame::GetGame()->_zCSession_world
+        && oCGame::GetGame()->_zCSession_world->GetSkyControllerOutdoor()
+        && oCGame::GetGame()->_zCSession_world->GetSkyControllerOutdoor()->GetWeatherType() == zTWEATHER_SNOW;
+
+    auto rainPS = e->GetShaderManager().GetPShader( isSnow ? "PS_Rain_Snow" : "PS_Rain" );
 
     UINT numParticles = state.RendererSettings.RainNumParticles;
 
     static float lastRadius = state.RendererSettings.RainRadiusRange;
     static float lastHeight = state.RendererSettings.RainHeightRange;
-    static UINT lastNumParticles = state.RendererSettings.RainNumParticles;
+    static UINT lastNumParticles = numParticles;
     static bool firstFrame = true;
 
     // Create resources if not already done
     if ( !RainBufferDrawFrom || lastHeight != state.RendererSettings.RainHeightRange
         || lastRadius != state.RendererSettings.RainRadiusRange ||
-        lastNumParticles != state.RendererSettings.RainNumParticles ) {
+        lastNumParticles != numParticles ) {
         delete RainBufferDrawFrom;
         delete RainBufferStreamTo;
         delete RainBufferInitial;
@@ -133,7 +142,13 @@ XRESULT D3D11Effect::DrawRain() {
 
     lastHeight = state.RendererSettings.RainHeightRange;
     lastRadius = state.RendererSettings.RainRadiusRange;
-    lastNumParticles = state.RendererSettings.RainNumParticles;
+    lastNumParticles = numParticles;
+
+    auto velocity = state.RendererSettings.RainGlobalVelocity;
+    if ( isSnow ) {
+        // make snow a lot slower
+        velocity = XMFLOAT3( velocity.x * snowSpeedFactor, velocity.y * snowSpeedFactor, velocity.z * snowSpeedFactor );
+    }
 
     // Update constantbuffer for the advance-VS
     AdvanceRainConstantBuffer acb;
@@ -144,7 +159,7 @@ XRESULT D3D11Effect::DrawRain() {
     acb.AR_Radius = state.RendererSettings.RainRadiusRange;
     acb.AR_Height = state.RendererSettings.RainHeightRange;
     acb.AR_CameraPosition = Engine::GAPI->GetCameraPosition();
-    acb.AR_GlobalVelocity = state.RendererSettings.RainGlobalVelocity;
+    acb.AR_GlobalVelocity = isSnow;
     acb.AR_MoveRainParticles = state.RendererSettings.RainMoveParticles ? 1 : 0;
     particleAdvanceVS->GetConstantBuffer()[0]->UpdateBuffer( &acb );
     particleAdvanceVS->GetConstantBuffer()[0]->BindToVertexShader( 1 );
@@ -231,6 +246,9 @@ XRESULT D3D11Effect::DrawRain() {
 
     RainShadowmap->BindToVertexShader( e->GetContext().Get(), 0 );
 
+    // Bind the shadow comparison sampler to the vertex shader at slot 2 (SS_Comp in shader)
+    e->GetContext()->VSSetSamplers( 2, 1, m_RainDropShadowSamplerState.GetAddressOf() );
+
     // Bind view/proj
     e->SetupVS_ExConstantBuffer();
 
@@ -253,17 +271,23 @@ XRESULT D3D11Effect::DrawRain_CS() {
     // Get shaders
     auto advanceRainCS = e->GetShaderManager().GetCShader( "CS_AdvanceRain" );
     auto particleVS = e->GetShaderManager().GetVShader( "VS_ParticlePointShaded" );
-    auto rainPS = e->GetShaderManager().GetPShader( "PS_Rain" );
+
+    bool isSnow = oCGame::GetGame()
+        && oCGame::GetGame()->_zCSession_world
+        && oCGame::GetGame()->_zCSession_world->GetSkyControllerOutdoor()
+        && oCGame::GetGame()->_zCSession_world->GetSkyControllerOutdoor()->GetWeatherType() == zTWEATHER_SNOW;
+    
+    auto rainPS = e->GetShaderManager().GetPShader( isSnow ? "PS_Rain_Snow" : "PS_Rain" );
 
     UINT numParticles = state.RendererSettings.RainNumParticles;
 
     static float lastRadius = state.RendererSettings.RainRadiusRange;
     static float lastHeight = state.RendererSettings.RainHeightRange;
-    static UINT lastNumParticles = state.RendererSettings.RainNumParticles;
+    static UINT lastNumParticles = numParticles;
 
     if ( !RainBufferDrawFrom || lastHeight != state.RendererSettings.RainHeightRange
         || lastRadius != state.RendererSettings.RainRadiusRange ||
-        (lastNumParticles + 127) / 128 != (state.RendererSettings.RainNumParticles + 127) / 128 ) {
+        (lastNumParticles + 127) / 128 != (numParticles + 127) / 128 ) {
         delete RainBufferDrawFrom;
 
         e->CreateVertexBuffer( &RainBufferDrawFrom );
@@ -280,7 +304,13 @@ XRESULT D3D11Effect::DrawRain_CS() {
 
     lastHeight = state.RendererSettings.RainHeightRange;
     lastRadius = state.RendererSettings.RainRadiusRange;
-    lastNumParticles = state.RendererSettings.RainNumParticles;
+    lastNumParticles = numParticles;
+
+    auto velocity = state.RendererSettings.RainGlobalVelocity;
+    if ( isSnow ) {
+        // make snow a lot slower
+        velocity = XMFLOAT3(velocity.x * snowSpeedFactor, velocity.y * snowSpeedFactor, velocity.z * snowSpeedFactor );
+    }
 
     // Update constantbuffer for the advance-CS
     AdvanceRainConstantBuffer acb;
@@ -291,7 +321,7 @@ XRESULT D3D11Effect::DrawRain_CS() {
     acb.AR_Radius = state.RendererSettings.RainRadiusRange;
     acb.AR_Height = state.RendererSettings.RainHeightRange;
     acb.AR_CameraPosition = Engine::GAPI->GetCameraPosition();
-    acb.AR_GlobalVelocity = state.RendererSettings.RainGlobalVelocity;
+    acb.AR_GlobalVelocity = velocity;
     acb.AR_MoveRainParticles = numParticles;
 
     advanceRainCS->GetConstantBuffer()[0]->UpdateBuffer( &acb );
@@ -350,6 +380,9 @@ XRESULT D3D11Effect::DrawRain_CS() {
 
     RainShadowmap->BindToVertexShader( e->GetContext().Get(), 0 );
 
+    // Bind the shadow comparison sampler to the vertex shader at slot 2 (SS_Comp in shader)
+    e->GetContext()->VSSetSamplers( 2, 1, m_RainDropShadowSamplerState.GetAddressOf() );
+
     // Bind view/proj
     e->SetupVS_ExConstantBuffer();
 
@@ -384,6 +417,24 @@ XRESULT D3D11Effect::LoadRainResources()
         SetDebugName( RainShadowmap->GetDepthStencilView().Get(), "RainShadowmap->DepthStencilView" );
         SetDebugName( RainShadowmap->GetShaderResView().Get(), "RainShadowmap->ShaderResView" );
         SetDebugName( RainShadowmap->GetTexture().Get(), "RainShadowmap->Texture" );
+    }
+
+    if ( !m_RainDropShadowSamplerState ) {
+        // same as in D3D11ShadowMap.cpp
+        D3D11_SAMPLER_DESC samplerDesc = {};
+        samplerDesc.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR;
+        samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
+        samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
+        samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+        samplerDesc.MipLODBias = 0;
+        samplerDesc.MaxAnisotropy = 1;
+        samplerDesc.ComparisonFunc = D3D11_COMPARISON_LESS_EQUAL;
+        samplerDesc.MinLOD = -FLT_MAX;
+        samplerDesc.MaxLOD = FLT_MAX;
+
+        HRESULT hr;
+        LE( e->GetDevice()->CreateSamplerState(&samplerDesc, m_RainDropShadowSamplerState.GetAddressOf()));
+        SetDebugName( m_RainDropShadowSamplerState.Get(), "RainDropSamplerState" );
     }
 
     return XR_SUCCESS;
@@ -448,9 +499,16 @@ XRESULT D3D11Effect::DrawRainShadowmap() {
     Engine::GAPI->GetRendererState().RendererSettings.DrawSkeletalMeshes = false;
 
     // Draw rain-shadowmap
+
+    // Save old rendertargets
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> oldRTV;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> oldDSV;
+    e->GetContext()->OMGetRenderTargets( 1, oldRTV.GetAddressOf(), oldDSV.GetAddressOf() );
+
     e->RenderShadowmaps( p, RainShadowmap.get(), true, false );
 
     // Restore old settings
+    e->GetContext()->OMSetRenderTargets( 1, oldRTV.GetAddressOf(), oldDSV.Get() );
     Engine::GAPI->GetRendererState().RendererSettings.DrawSkeletalMeshes = oldDrawSkel;
     Engine::GAPI->GetRendererState().GraphicsState.FF_AlphaRef = oldAlphaRef;
     if ( PS_Diffuse ) {

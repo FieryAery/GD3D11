@@ -14,11 +14,106 @@
 
 #include "D3D11GraphicsEngineBase.h"
 #include <d3dcompiler.h>
+#include "D3D11PFX_TAA.h"
 
 // Patch HLSL-Compiler for http://support.microsoft.com/kb/2448404
 #if D3DX_VERSION == 0xa2b
 #pragma ruledisable 0x0802405f
 #endif
+
+#include <fstream>
+#include <unordered_map>
+
+namespace
+{
+    // Include handler that resolves includes relative to the including file
+    // and also files relative to any relative included file (i.e. nested includes).
+    class D3D11FileRelativeInclude final : public ID3DInclude
+    {
+    public:
+        explicit D3D11FileRelativeInclude( std::filesystem::path rootDir )
+            : RootDir( std::move( rootDir ) )
+        {
+        }
+
+        HRESULT __stdcall Open( D3D_INCLUDE_TYPE includeType, LPCSTR pFileName, LPCVOID pParentData, LPCVOID* ppData, UINT* pBytes ) override
+        {
+            if ( ppData == nullptr || pBytes == nullptr || pFileName == nullptr )
+                return E_INVALIDARG;
+
+            std::filesystem::path baseDir = RootDir;
+
+            // If pParentData is an include we previously returned, use its directory as base.
+            if ( pParentData != nullptr ) {
+                auto it = ParentDirByData.find( pParentData );
+                if ( it != ParentDirByData.end() )
+                    baseDir = it->second;
+            }
+
+            std::filesystem::path requested = std::filesystem::path( pFileName );
+
+            // Resolve strategy:
+            // 1) If requested is absolute -> use it
+            // 2) else -> resolve relative to includer's directory (baseDir)
+            // 3) If not found, optionally fall back to RootDir (useful for global include roots)
+            std::filesystem::path fullPath = requested.is_absolute() ? requested : (baseDir / requested);
+            fullPath = fullPath.lexically_normal();
+
+            if ( !std::filesystem::exists( fullPath ) && !requested.is_absolute() ) {
+                std::filesystem::path fallback = (RootDir / requested).lexically_normal();
+                if ( std::filesystem::exists( fallback ) )
+                    fullPath = fallback;
+            }
+
+            std::ifstream file( fullPath, std::ios::binary );
+            if ( !file )
+                return HRESULT_FROM_WIN32( ERROR_FILE_NOT_FOUND );
+
+            file.seekg( 0, std::ios::end );
+            const std::streamoff size = file.tellg();
+            file.seekg( 0, std::ios::beg );
+
+            if ( size <= 0 )
+                return HRESULT_FROM_WIN32( ERROR_INVALID_DATA );
+
+            auto buffer = std::make_unique<uint8_t[]>( static_cast<size_t>(size) );
+            file.read( reinterpret_cast<char*>(buffer.get()), size );
+            if ( !file )
+                return HRESULT_FROM_WIN32( ERROR_READ_FAULT );
+
+            const void* dataPtr = buffer.get();
+            *ppData = dataPtr;
+            *pBytes = static_cast<UINT>(size);
+
+            // Track the directory of THIS include, so nested includes resolve against it.
+            ParentDirByData.emplace( dataPtr, fullPath.parent_path() );
+
+            OwnedBuffers.emplace_back( std::move( buffer ) );
+            return S_OK;
+        }
+
+        HRESULT __stdcall Close( LPCVOID pData ) override
+        {
+            if ( pData == nullptr )
+                return E_INVALIDARG;
+
+            ParentDirByData.erase( pData );
+
+            // Owned buffer lifetime is tied to this include handler; we can keep it until the compile ends.
+            // (D3DCompile will call Close, but we keep buffers to avoid pointer invalidation for ParentDirByData lookups.)
+            return S_OK;
+        }
+
+    private:
+        std::filesystem::path RootDir;
+
+        // key: pointer handed to compiler (ppData), value: directory of that include
+        std::unordered_map<const void*, std::filesystem::path> ParentDirByData;
+
+        // keep memory alive for duration of compilation
+        std::vector<std::unique_ptr<uint8_t[]>> OwnedBuffers;
+    };
+}
 
 const int NUM_MAX_BONES = 96;
 
@@ -39,20 +134,15 @@ D3D11ShaderManager::~D3D11ShaderManager() {
 HRESULT D3D11ShaderManager::CompileShaderFromFile( const CHAR* szFileName, LPCSTR szEntryPoint, LPCSTR szShaderModel, ID3DBlob** ppBlobOut, const std::vector<D3D_SHADER_MACRO>& makros ) {
     HRESULT hr = S_OK;
 
-    char dir[260];
-    GetCurrentDirectoryA( 260, dir );
-    SetCurrentDirectoryA( Engine::GAPI->GetStartDirectory().c_str() );
-
     DWORD dwShaderFlags = 0;
-#if defined(DEBUG) || defined(_DEBUG)
+#if defined(DEBUG_D3D11)
     // Set the D3DCOMPILE_DEBUG flag to embed debug information in the shaders.
     // Setting this flag improves the shader debugging experience, but still allows 
     // the shaders to be optimized and to run exactly the way they will run in 
     // the release configuration of this program.
-    //dwShaderFlags |= D3DCOMPILE_DEBUG;
-#else
-    dwShaderFlags |= D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
+    dwShaderFlags |= D3DCOMPILE_DEBUG;
 #endif
+    dwShaderFlags |= D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
 
     // Construct makros
     std::vector<D3D_SHADER_MACRO> m;
@@ -62,18 +152,27 @@ HRESULT D3D11ShaderManager::CompileShaderFromFile( const CHAR* szFileName, LPCST
     m.insert( m.begin(), makros.begin(), makros.end() );
 
     Microsoft::WRL::ComPtr<ID3DBlob> pErrorBlob;
-    hr = D3DCompileFromFile( Toolbox::ToWideChar( szFileName ).c_str(), &m[0], D3D_COMPILE_STANDARD_FILE_INCLUDE, szEntryPoint, szShaderModel, dwShaderFlags, 0, ppBlobOut, &pErrorBlob );
+
+    auto shaderFile = Toolbox::ToWideChar( szFileName );
+    
+    std::filesystem::path shaderPath( shaderFile );
+
+    // absolute path
+    shaderPath = Engine::GAPI->GetStartDirectory().c_str() / shaderPath;
+
+    D3D11FileRelativeInclude includeHandler( shaderPath.parent_path() );
+
+    hr = D3DCompileFromFile( shaderPath.wstring().c_str(), &m[0], &includeHandler, szEntryPoint, szShaderModel, dwShaderFlags, 0, ppBlobOut, &pErrorBlob);
+    
     if ( FAILED( hr ) ) {
         LogInfo() << "Shader compilation failed!";
         if ( pErrorBlob.Get() ) {
             LogErrorBox() << reinterpret_cast<char*>(pErrorBlob->GetBufferPointer()) << "\n\n (You can ignore the next error from Gothic about too small video memory!)";
         }
 
-        SetCurrentDirectoryA( dir );
         return hr;
     }
 
-    SetCurrentDirectoryA( dir );
     return S_OK;
 }
 
@@ -84,6 +183,9 @@ XRESULT D3D11ShaderManager::Init() {
     Shaders = std::vector<ShaderInfo>();
     VShaders = std::unordered_map<std::string, std::shared_ptr<D3D11VShader>>();
     PShaders = std::unordered_map<std::string, std::shared_ptr<D3D11PShader>>();
+
+    D3D_SHADER_MACRO m;
+    std::vector<D3D_SHADER_MACRO> makros;
 
     Shaders.push_back( ShaderInfo( "VS_Ex", "VS_Ex.hlsl", "v", 1 ) );
     Shaders.back().cBufferSizes.push_back( sizeof( VS_ExConstantBuffer_PerFrame ) );
@@ -160,6 +262,10 @@ XRESULT D3D11ShaderManager::Init() {
 
     Shaders.push_back( ShaderInfo( "PS_Rain", "PS_Rain.hlsl", "p" ) );
 
+    makros.push_back( D3D_SHADER_MACRO{ "SNOW_FEATURE", "1" } );
+    Shaders.push_back( ShaderInfo( "PS_Rain_Snow", "PS_Rain.hlsl", "p" , makros ) );
+    makros.clear();
+
     Shaders.push_back( ShaderInfo( "PS_Transparency", "PS_Transparency.hlsl", "p" ) );
     Shaders.back().cBufferSizes.push_back( sizeof( GhostAlphaConstantBuffer ) );
 
@@ -212,9 +318,6 @@ XRESULT D3D11ShaderManager::Init() {
     Shaders.push_back( ShaderInfo( "PS_PFX_LumConvert", "PS_PFX_LumConvert.hlsl", "p" ) );
     Shaders.push_back( ShaderInfo( "PS_PFX_LumAdapt", "PS_PFX_LumAdapt.hlsl", "p" ) );
     Shaders.back().cBufferSizes.push_back( sizeof( LumAdaptConstantBuffer ) );
-        
-    D3D_SHADER_MACRO m;
-    std::vector<D3D_SHADER_MACRO> makros;
 
     m.Name = "USE_TONEMAP";
     m.Definition = "4";
@@ -446,6 +549,20 @@ XRESULT D3D11ShaderManager::Init() {
 
     Shaders.push_back( ShaderInfo( "VS_AdvanceRain", "VS_AdvanceRain.hlsl", "v", 13 ) );
     Shaders.back().cBufferSizes.push_back( sizeof( AdvanceRainConstantBuffer ) );
+
+    // TAA Shader
+    ShaderInfo taaInfo( "PS_PFX_TAA", "PS_PFX_TAA.hlsl", "p", makros );
+    taaInfo.cBufferSizes.push_back( sizeof( TAAConstantBuffer ) );
+    Shaders.push_back( taaInfo );
+
+    // Velocity Buffer Shader
+    ShaderInfo velocityInfo( "PS_PFX_Velocity", "PS_PFX_Velocity.hlsl", "p", makros );
+    velocityInfo.cBufferSizes.push_back( sizeof( VelocityBufferConstantBuffer ) );
+    Shaders.push_back( velocityInfo );
+
+    ShaderInfo casInfo( "PS_PFX_CAS", "PS_PFX_CAS.hlsl", "p", makros );
+    casInfo.cBufferSizes.push_back( sizeof( CASConstantBuffer ) );
+    Shaders.push_back( casInfo );
 
     if ( !FeatureLevel10Compatibility ) {
         Shaders.push_back( ShaderInfo( "CS_AdvanceRain", "CS_AdvanceRain.hlsl", "c" ) );
