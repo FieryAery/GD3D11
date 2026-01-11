@@ -1416,6 +1416,9 @@ XRESULT D3D11GraphicsEngine::Present() {
         }
     }
 
+    // Restore the depth buffer from the copy
+    GetContext()->CopyResource( DepthStencilBuffer->GetTexture().Get(), DepthStencilBufferCopy->GetTexture().Get() );
+
     // Don't allow presenting from different thread than mainthread
     // shouldn't happen but who knows
     if ( Engine::GAPI->GetMainThreadID() != GetCurrentThreadId() ) {
@@ -2714,8 +2717,13 @@ XRESULT D3D11GraphicsEngine::OnStartWorldRendering() {
         DrawUnderwaterEffects();
     }
 
+    // Store the current depth state to the copy buffer before clear
+    CopyDepthStencil();
+
     // Clear here to get a working depthbuffer but no interferences with world
     // geometry for gothic UI-Rendering
+    GetContext()->ClearDepthStencilView( DepthStencilBuffer->GetDepthStencilView().Get(),
+        D3D11_CLEAR_DEPTH, 0, 0 );
     GetContext()->OMSetRenderTargets( 1, HDRBackBuffer->GetRenderTargetView().GetAddressOf(),
         nullptr );
 
